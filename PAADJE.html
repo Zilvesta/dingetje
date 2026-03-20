@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Olifantenpaadjes & McDonald's Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        #map {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+        }
+        .controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 1000;
+            min-width: 280px;
+            max-width: 340px;
+        }
+        .controls h3 {
+            margin: 0 0 15px 0;
+            font-size: 16px;
+            color: #333;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+            color: #666;
+        }
+        input[type="range"], input[type="number"] {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        input[type="number"] {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .value-display {
+            font-weight: bold;
+            color: #d4202a;
+            font-size: 18px;
+            margin-top: 6px;
+        }
+        .stats, .legend, .status, .source {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+            font-size: 13px;
+            color: #666;
+        }
+        .stats div, .status div, .source div {
+            margin: 5px 0;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+            font-size: 13px;
+        }
+        .legend-icon {
+            width: 16px;
+            height: 16px;
+            margin-right: 8px;
+            border-radius: 50%;
+        }
+        .legend-line {
+            width: 18px;
+            height: 0;
+            margin-right: 8px;
+            border-top: 4px solid #4CAF50;
+            border-radius: 2px;
+        }
+        .mcdonalds-icon {
+            background: #d4202a;
+        }
+        .hint {
+            font-size: 12px;
+            color: #777;
+            line-height: 1.4;
+        }
+        .loading {
+            color: #0a66c2;
+        }
+        .error {
+            color: #c62828;
+        }
+        .success {
+            color: #2e7d32;
+        }
+        a {
+            color: inherit;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div class="controls">
+        <h3>🍔 McPaths Filter</h3>
+
+        <div class="source">
+            <div><strong>McDonald's source</strong></div>
+            <div class="hint" id="csvSourceLabel">https://mcd-pad.vercel.app/mcdonalds_netherlands.csv</div>
+        </div>
+
+        <div class="control-group">
+            <label for="maxDistance">Maximum Range (meters)</label>
+            <input type="number" id="maxDistance" min="50" max="10000" value="300" step="50">
+        </div>
+
+        <div class="control-group">
+            <label for="distance">Distance Radius</label>
+            <input type="range" id="distance" min="0" max="300" value="100" step="10">
+            <div class="value-display"><span id="distanceValue">100 meters</span></div>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-icon mcdonalds-icon"></div>
+                <span>McDonald's</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-line"></div>
+                <span>Informal OSM paths</span>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div><strong>Visible in current map view:</strong></div>
+            <div>🍔 <span id="mcCount">0</span> McDonald's</div>
+            <div>🛤️ <span id="pathCount">0</span> informal paths</div>
+        </div>
+
+        <div class="status">
+            <div id="statusText" class="hint">Loading McDonald’s CSV…</div>
+        </div>
+
+        <div class="hint">
+            If the CSV fails to load on GitHub Pages, the most likely cause is CORS on the Vercel CSV response.
+        </div>
+    </div>
+
+    <script>
+        const CSV_URL = 'https://mcd-pad.vercel.app/mcdonalds_netherlands.csv';
+        const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+
+        const map = L.map('map').setView([52.3676, 4.9041], 8);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 19
+        }).addTo(map);
+
+        let mcdonaldsData = [];
+        let osmPathsData = [];
+
+        const mcdonaldsMarkers = L.layerGroup().addTo(map);
+        const pathsLayer = L.layerGroup().addTo(map);
+
+        let mcLoaded = false;
+        let overpassAbortController = null;
+
+        function setStatus(message, type = '') {
+            const el = document.getElementById('statusText');
+            el.textContent = message;
+            el.className = type || 'hint';
+        }
+
+        function getMarkerSize(baseSize) {
+            const zoom = map.getZoom();
+            const scale = Math.max(1, (12 - zoom) * 0.5 + 1);
+            return baseSize * scale;
+        }
+
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const phi1 = lat1 * Math.PI / 180;
+            const phi2 = lat2 * Math.PI / 180;
+            const dPhi = (lat2 - lat1) * Math.PI / 180;
+            const dLambda = (lon2 - lon1) * Math.PI / 180;
+
+            const a = Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
+                      Math.cos(phi1) * Math.cos(phi2) *
+                      Math.sin(dLambda / 2) * Math.sin(dLambda / 2);
+
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }
+
+        function latLngToMeters(lat, lon, refLat) {
+            const x = lon * 111320 * Math.cos(refLat * Math.PI / 180);
+            const y = lat * 110540;
+            return { x, y };
+        }
+
+        function pointToSegmentDistanceMeters(p, a, b) {
+            const refLat = (p.lat + a.lat + b.lat) / 3;
+
+            const P = latLngToMeters(p.lat, p.lon, refLat);
+            const A = latLngToMeters(a.lat, a.lon, refLat);
+            const B = latLngToMeters(b.lat, b.lon, refLat);
+
+            const ABx = B.x - A.x;
+            const ABy = B.y - A.y;
+            const APx = P.x - A.x;
+            const APy = P.y - A.y;
+
+            const ab2 = ABx * ABx + ABy * ABy;
+            if (ab2 === 0) {
+                const dx = P.x - A.x;
+                const dy = P.y - A.y;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+
+            let t = (APx * ABx + APy * ABy) / ab2;
+            t = Math.max(0, Math.min(1, t));
+
+            const closestX = A.x + t * ABx;
+            const closestY = A.y + t * ABy;
+
+            const dx = P.x - closestX;
+            const dy = P.y - closestY;
+
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        function distancePointToPolylineMeters(point, polylineCoords) {
+            if (!polylineCoords || polylineCoords.length === 0) return Infinity;
+            if (polylineCoords.length === 1) {
+                return getDistance(point.lat, point.lon, polylineCoords[0].lat, polylineCoords[0].lon);
+            }
+
+            let minDistance = Infinity;
+
+            for (let i = 0; i < polylineCoords.length - 1; i++) {
+                const dist = pointToSegmentDistanceMeters(
+                    point,
+                    polylineCoords[i],
+                    polylineCoords[i + 1]
+                );
+                if (dist < minDistance) minDistance = dist;
+            }
+
+            return minDistance;
+        }
+
+        function polylineHasNearbyMc(pathCoords, mcLocations, maxDistance) {
+            return mcLocations.some(mc => distancePointToPolylineMeters(mc, pathCoords) <= maxDistance);
+        }
+
+        function mcHasNearbyPath(mc, pathList, maxDistance) {
+            return pathList.some(path => distancePointToPolylineMeters(mc, path.coords) <= maxDistance);
+        }
+
+        function formatDistance(meters) {
+            return meters >= 1000
+                ? `${(meters / 1000).toFixed(1)} km`
+                : `${Math.round(meters)} meters`;
+        }
+
+        function getVisibleMcDonalds() {
+            const bounds = map.getBounds();
+            return mcdonaldsData.filter(mc => bounds.contains([mc.lat, mc.lon]));
+        }
+
+        function getVisiblePaths() {
+            const bounds = map.getBounds();
+            return osmPathsData.filter(path =>
+                path.coords.some(coord => bounds.contains([coord.lat, coord.lon]))
+            );
+        }
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function updateMap() {
+            const maxDistance = parseInt(document.getElementById('distance').value, 10);
+            document.getElementById('distanceValue').textContent = formatDistance(maxDistance);
+
+            mcdonaldsMarkers.clearLayers();
+            pathsLayer.clearLayers();
+
+            if (!mcLoaded) {
+                document.getElementById('mcCount').textContent = 0;
+                document.getElementById('pathCount').textContent = 0;
+                return;
+            }
+
+            const visibleMc = getVisibleMcDonalds();
+            const visiblePaths = getVisiblePaths();
+
+            let visibleMcCount = 0;
+            let visiblePathCount = 0;
+
+            visibleMc.forEach(mc => {
+                if (mcHasNearbyPath(mc, visiblePaths, maxDistance)) {
+                    const marker = L.circleMarker([mc.lat, mc.lon], {
+                        radius: getMarkerSize(6),
+                        fillColor: '#d4202a',
+                        color: '#fff',
+                        weight: 2,
+                        opacity: 1,
+                        fillOpacity: 0.85
+                    }).bindPopup(`
+                        <strong>🍔 ${escapeHtml(mc.name || "McDonald's")}</strong><br>
+                        <a href="https://www.openstreetmap.org/?mlat=${mc.lat}&mlon=${mc.lon}#map=18/${mc.lat}/${mc.lon}" target="_blank" rel="noopener noreferrer" style="color: #d4202a; text-decoration: none;">
+                            📍 Open in OpenStreetMap →
+                        </a>
+                    `);
+
+                    mcdonaldsMarkers.addLayer(marker);
+                    visibleMcCount++;
+                }
+            });
+
+            visiblePaths.forEach(path => {
+                if (polylineHasNearbyMc(path.coords, visibleMc, maxDistance)) {
+                    const latlngs = path.coords.map(c => [c.lat, c.lon]);
+
+                    const line = L.polyline(latlngs, {
+                        color: '#4CAF50',
+                        weight: 4,
+                        opacity: 0.85
+                    }).bindPopup(`
+                        <strong>🛤️ ${escapeHtml(path.name || 'Unnamed informal path')}</strong><br>
+                        ${path.highway ? `Type: ${escapeHtml(path.highway)}<br>` : ''}
+                        ${path.surface ? `Surface: ${escapeHtml(path.surface)}<br>` : ''}
+                        ${path.id ? `<a href="https://www.openstreetmap.org/way/${path.id}" target="_blank" rel="noopener noreferrer" style="color: #4CAF50; text-decoration: none;">🔗 View OSM way →</a>` : ''}
+                    `);
+
+                    pathsLayer.addLayer(line);
+                    visiblePathCount++;
+                }
+            });
+
+            document.getElementById('mcCount').textContent = visibleMcCount;
+            document.getElementById('pathCount').textContent = visiblePathCount;
+        }
+
+        async function loadOsmInformalPaths() {
+            if (!mcLoaded) return;
+
+            const bounds = map.getBounds();
+            const south = bounds.getSouth();
+            const west = bounds.getWest();
+            const north = bounds.getNorth();
+            const east = bounds.getEast();
+
+            if (overpassAbortController) {
+                overpassAbortController.abort();
+            }
+            overpassAbortController = new AbortController();
+
+            setStatus('McDonald’s loaded. Loading informal OSM paths…', 'loading');
+
+            const query = `
+[out:json][timeout:25];
+(
+  way["informal"="yes"]["highway"~"^(path|footway|track|cycleway|bridleway|steps)$"](${south},${west},${north},${east});
+);
+out geom;
+`;
+
+            try {
+                const response = await fetch(OVERPASS_URL, {
+                    method: 'POST',
+                    body: query,
+                    signal: overpassAbortController.signal
+                });
+
+                if (!response.ok) {
+                    throw new Error('Overpass request failed with status ' + response.status);
+                }
+
+                const data = await response.json();
+
+                osmPathsData = (data.elements || [])
+                    .filter(el => el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length > 1)
+                    .map(el => ({
+                        id: el.id,
+                        name: el.tags?.name || '',
+                        highway: el.tags?.highway || '',
+                        surface: el.tags?.surface || '',
+                        coords: el.geometry.map(p => ({
+                            lat: p.lat,
+                            lon: p.lon
+                        }))
+                    }));
+
+                setStatus(
+                    `Loaded ${mcdonaldsData.length} McDonald’s locations and ${osmPathsData.length} informal OSM paths.`,
+                    'success'
+                );
+                updateMap();
+            } catch (error) {
+                if (error.name === 'AbortError') return;
+
+                console.error(error);
+                osmPathsData = [];
+                setStatus('McDonald’s loaded, but OSM paths could not be fetched right now.', 'error');
+                updateMap();
+            }
+        }
+
+        function loadMcDonaldsCsv() {
+            setStatus('Loading McDonald’s CSV…', 'loading');
+
+            Papa.parse(CSV_URL, {
+                download: true,
+                header: true,
+                skipEmptyLines: true,
+                complete: function(results) {
+                    const parsed = results.data
+                        .filter(row => row.latitude && row.longitude)
+                        .map(row => ({
+                            name: row.name || "McDonald's",
+                            lat: parseFloat(row.latitude),
+                            lon: parseFloat(row.longitude)
+                        }))
+                        .filter(row => !Number.isNaN(row.lat) && !Number.isNaN(row.lon));
+
+                    if (!parsed.length) {
+                        mcLoaded = false;
+                        mcdonaldsData = [];
+                        updateMap();
+                        setStatus('CSV loaded, but no valid latitude/longitude rows were found.', 'error');
+                        return;
+                    }
+
+                    mcdonaldsData = parsed;
+                    mcLoaded = true;
+                    loadOsmInformalPaths();
+                },
+                error: function(err) {
+                    console.error(err);
+                    mcLoaded = false;
+                    mcdonaldsData = [];
+                    updateMap();
+
+                    setStatus(
+                        'Could not load the CSV from mcd-pad.vercel.app. Most likely this is a cross-origin/CORS restriction on that file response.',
+                        'error'
+                    );
+                }
+            });
+        }
+
+        function debounce(fn, delay) {
+            let timeout;
+            return function(...args) {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => fn.apply(this, args), delay);
+            };
+        }
+
+        document.getElementById('distance').addEventListener('input', updateMap);
+
+        document.getElementById('maxDistance').addEventListener('input', function() {
+            const maxValue = parseInt(this.value, 10) || 300;
+            const distanceSlider = document.getElementById('distance');
+
+            distanceSlider.max = maxValue;
+
+            if (parseInt(distanceSlider.value, 10) > maxValue) {
+                distanceSlider.value = maxValue;
+            }
+
+            updateMap();
+        });
+
+        const debouncedReload = debounce(() => {
+            loadOsmInformalPaths();
+        }, 800);
+
+        map.on('moveend', () => {
+            updateMap();
+            debouncedReload();
+        });
+
+        map.on('zoomend', () => {
+            updateMap();
+            debouncedReload();
+        });
+
+        loadMcDonaldsCsv();
+    </script>
+</body>
+</html>
